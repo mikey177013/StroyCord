@@ -15,7 +15,7 @@ export const nowPlayingEmbed = (song: songInterface): EmbedBuilder => {
   return new EmbedBuilder()
     .setTitle(`🎶 ${i18n.t('embedsText.song.nowPlaying.title')} 🎶`)
     .setAuthor({
-      name: 'Stroycord',
+      name: 'sano.senxpai',
       iconURL: stroyCordLogo,
     })
     .setColor('#37123C')
