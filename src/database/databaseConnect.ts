@@ -1,19 +1,17 @@
-import mongoose from 'mongoose';
-
-import { secrets } from '../config/secrets';
+import { db } from './db';
 import { emptyAllGuild } from './queries/guilds/delete';
+
+export { db };
 
 export const connectToDatabase = async () => {
   try {
-    await mongoose.connect(secrets.DATABASE_CONNECTION_STRING, {
-      dbName: secrets.DATABASE_NAME,
-      authSource: 'admin',
-      user: secrets.DATABASE_USER,
-      pass: secrets.DATABASE_PASSWORD,
-    });
+    // On startup, wipe transient runtime state from every guild
+    // (queues + current voice channel) since activePlayers is always empty
+    // on a fresh start.
     await emptyAllGuild();
-  } catch (_error) {
-    console.error('Error connecting to database !', _error);
+    console.log('[db] sqlite ready');
+  } catch (error) {
+    console.error('[db] error initializing database:', error);
     process.exit(1);
   }
 };

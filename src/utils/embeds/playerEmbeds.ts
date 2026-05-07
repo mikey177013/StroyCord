@@ -5,87 +5,77 @@ import { getFirstSong, getLastPlayedSong } from 'src/database/queries/guilds/get
 
 import type { songInterface } from '../interfaces';
 
-const stroyCordLogo = secrets.STROYCORD_LOGO;
+const AUTHOR_NAME = 'sano.senxpai';
+const BRAND_COLOR = '#37123C';
+const sanoLogo = secrets.SANO_LOGO;
 
 export const pauseEmbed = (author: User) => {
   return new EmbedBuilder()
-    .setTitle(`⏸ ${author.username} ${i18n.t('embedsText.player.pause.title')} !`)
+    .setTitle(`${author.username} ${i18n.t('embedsText.player.pause.title')}`)
     .setDescription(
-      `${i18n.t('embedsText.global.youCanUse')} ${secrets.PREFIX}` +
-        '`re` ' +
-        `${i18n.t('embedsText.player.pause.description')} !`
+      `${i18n.t('embedsText.global.youCanUse')} \`${secrets.PREFIX}re\` ${i18n.t('embedsText.player.pause.description')}`
     )
-    .setAuthor({
-      name: 'Stroycord',
-      iconURL: stroyCordLogo,
-    })
-    .setColor('#37123C')
+    .setAuthor({ name: AUTHOR_NAME, iconURL: sanoLogo })
+    .setColor(BRAND_COLOR)
     .setTimestamp();
 };
 
 export const resumeEmbed = (author: User) => {
   return new EmbedBuilder()
-    .setTitle(`▶ ${author.username} ${i18n.t('embedsText.player.resume.title')} !`)
+    .setTitle(`${author.username} ${i18n.t('embedsText.player.resume.title')}`)
     .setDescription(
-      `${i18n.t('embedsText.global.youCanUse')} ${secrets.PREFIX}` +
-        '`pa` ' +
-        `${i18n.t('embedsText.player.resume.description')} !`
+      `${i18n.t('embedsText.global.youCanUse')} \`${secrets.PREFIX}pa\` ${i18n.t('embedsText.player.resume.description')}`
     )
-    .setAuthor({
-      name: 'Stroycord',
-      iconURL: stroyCordLogo,
-    })
-    .setColor('#37123C')
+    .setAuthor({ name: AUTHOR_NAME, iconURL: sanoLogo })
+    .setColor(BRAND_COLOR)
     .setTimestamp();
 };
 
 export const skipEmbed = async (author: User, guildId: string) => {
-  const nextSong: songInterface = await getFirstSong(guildId);
-  const lastSong: songInterface = await getLastPlayedSong(guildId);
+  const nextSong: songInterface | undefined = await getFirstSong(guildId);
+  const lastSong: songInterface | undefined = await getLastPlayedSong(guildId);
 
-  return new EmbedBuilder()
-    .setTitle(`⏭ ${author.username} ${i18n.t('embedsText.player.skip.title')} !`)
+  const embed = new EmbedBuilder()
+    .setTitle(`${author.username} ${i18n.t('embedsText.player.skip.title')}`)
     .setDescription(
-      `${i18n.t('embedsText.global.youCanUse')} ${secrets.PREFIX}` +
-        '`fo` ' +
-        `${i18n.t('embedsText.player.skip.description')} !`
+      `${i18n.t('embedsText.global.youCanUse')} \`${secrets.PREFIX}fo\` ${i18n.t('embedsText.player.skip.description')}`
     )
-    .addFields(
+    .setAuthor({ name: AUTHOR_NAME, iconURL: sanoLogo })
+    .setColor(BRAND_COLOR)
+    .setTimestamp();
+
+  if (nextSong) {
+    embed.addFields(
       {
-        name: `${i18n.t('embedsText.player.skip.fields.nowPlaying')} :`,
-        value: `${nextSong.title} - ${nextSong.videoAuthor}`,
+        name: i18n.t('embedsText.player.skip.fields.nowPlaying'),
+        value: `${nextSong.title} — ${nextSong.videoAuthor}`,
         inline: true,
       },
       {
-        name: `${i18n.t('embedsText.global.duration')} :`,
+        name: i18n.t('embedsText.global.duration'),
         value: nextSong.videoLength,
         inline: true,
-      },
-      {
-        name: `${i18n.t('embedsText.player.skip.fields.previouslyPlayed')} :`,
-        value: `${lastSong.title} - ${lastSong.videoAuthor}`,
       }
-    )
-    .setAuthor({
-      name: 'Stroycord',
-      iconURL: stroyCordLogo,
-    })
-    .setColor('#37123C')
-    .setTimestamp();
+    );
+  }
+
+  if (lastSong) {
+    embed.addFields({
+      name: i18n.t('embedsText.player.skip.fields.previouslyPlayed'),
+      value: `${lastSong.title} — ${lastSong.videoAuthor}`,
+    });
+  }
+
+  return embed;
 };
 
 export const removeEmbed = (author: User) => {
   return new EmbedBuilder()
-    .setTitle(`❌ ${author.username} ${i18n.t('embedsText.player.remove.title')} !`)
+    .setTitle(`${author.username} ${i18n.t('embedsText.player.remove.title')}`)
     .setDescription(
-      `${i18n.t('embedsText.global.youCanUse')} ${secrets.PREFIX}` +
-        '`p [args]`' +
-        `${i18n.t('embedsText.global.toLaunchANewMusic')} !`
+      `${i18n.t('embedsText.global.youCanUse')} \`${secrets.PREFIX}p [args]\` ${i18n.t('embedsText.global.toLaunchANewMusic')}`
     )
-    .setAuthor({
-      name: 'Stroycord',
-      iconURL: stroyCordLogo,
-    })
-    .setColor('#37123C')
+    .setAuthor({ name: AUTHOR_NAME, iconURL: sanoLogo })
+    .setColor(BRAND_COLOR)
     .setTimestamp();
 };

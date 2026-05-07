@@ -19,5 +19,10 @@ COPY --from=build /build/dist ./dist
 COPY --from=build /build/node_modules ./node_modules
 COPY --from=build /build/package.json ./
 
+# sqlite db file lives in /app/data — mount a volume here to persist across rebuilds
+RUN mkdir -p /app/data && chown -R node:node /app
+WORKDIR /app/data
+WORKDIR /app
+
 USER node
 CMD ["node", "dist/Bot.js"]

@@ -12,7 +12,8 @@ npm run start      # Run compiled dist/Bot.js (production)
 npm run knip       # Detect unused exports/files
 ```
 
-The bot requires a running MongoDB instance and valid `.env` to start.
+The bot uses an embedded SQLite database (`better-sqlite3`). A `data.db` file
+is created in the working directory on first run — no external DB server needed.
 
 **Tests (Vitest):**
 ```bash
@@ -21,11 +22,10 @@ npm run test:functional    # Functional tests only
 npm run test:coverage      # Run with coverage report
 ```
 
-**Docker (full stack):**
+**Docker:**
 ```bash
-docker compose up -d           # Starts bot + MongoDB + mongo-express (UI on :8081)
+docker compose up -d           # Starts the bot (sqlite data persisted on the sano-data volume)
 npm run docker:logs            # Tail bot logs
-npm run docker:test-env        # Start only MongoDB + mongo-express (for local dev)
 npm run docker:clean           # Full teardown including volumes
 ```
 
@@ -44,17 +44,17 @@ Both paths ultimately call the same functions in `textCommands.ts`, which call i
 
 Three handlers resolve the input type before calling into the player:
 
-- `songRequest.ts` — single YouTube URL → calls `ytdl.getInfo` to extract metadata → `pushSongs` to DB → `songPlayer`
-- `playlistRequest.ts` — playlist URL → iterates via `ytpl`, calls `songRequest` per item
-- `searchRequest.ts` — text search → `ytsr` (limit 1) → calls `songRequest` with the first result
+- `songRequest.ts` — single YouTube URL → `youtubei.js` for metadata → `pushSongs` to DB → `songPlayer`
+- `playlistRequest.ts` — playlist URL → iterates via `youtubei.js`, calls `songRequest` per item
+- `searchRequest.ts` — text search → `youtubei.js` search (limit 1) → calls `songRequest` with the first result
 
 ### Player (`src/core/player.ts`)
 
 `songPlayer(guildId)` is the core playback engine:
-- Fetches the first song from MongoDB (`nextSongs[0]`)
+- Fetches the first song from SQLite (`nextSongs[0]`)
 - Joins the voice channel stored in DB
 - Creates/reuses an `AudioPlayer` stored in the in-memory `activePlayers` map (exported from `Bot.ts`)
-- Streams audio via `youtube-dl-exec` piped to `createAudioResource`
+- Streams audio via `yt-dlp` (spawned from `youtube-dl-exec`) piped to `createAudioResource`
 
 `activePlayers` is an in-memory map `{ [guildId]: { audioPlayer } }` — the single source of truth for whether a guild is currently playing.
 
@@ -63,21 +63,37 @@ Three handlers resolve the input type before calling into the player:
 | State | Where |
 |---|---|
 | Is playing / AudioPlayer ref | `activePlayers` (in-memory, `Bot.ts`) |
-| Song queue (`nextSongs`) | MongoDB `Guild` document |
-| Play history (`previouslyPlayedSongs`) | MongoDB `Guild` document |
-| Current voice channel | MongoDB `Guild` document |
+| Song queue (`nextSongs`) | SQLite `guilds.data` (JSON column) |
+| Play history (`previouslyPlayedSongs`) | SQLite `guilds.data` (JSON column) |
+| Current voice channel | SQLite `guilds.data` (JSON column) |
 
-On startup, `connectToDatabase` calls `emptyAllGuild()` — this wipes all queues and voice channel state from every guild, since in-memory `activePlayers` is always empty on a fresh start.
+On startup, `connectToDatabase` calls `emptyAllGuild()` — this wipes all queues
+and voice channel state from every guild, since in-memory `activePlayers` is
+always empty on a fresh start.
 
-### MongoDB Schema (`src/database/schema/guild.ts`)
+### SQLite Schema (`src/database/databaseConnect.ts`)
 
-Single `Guild` collection per Discord server:
-- `guildId` — Discord guild ID (lookup key)
-- `nextSongs[]` — ordered queue of `songInterface` objects
+A single table:
+
+```sql
+CREATE TABLE guilds (
+  id   TEXT PRIMARY KEY,   -- Discord guild ID
+  data TEXT NOT NULL       -- JSON-encoded Guild
+);
+```
+
+The `data` column stores the full `Guild` record from
+`src/database/schema/guild.ts`:
+
+- `guildId` — Discord guild ID
+- `registeredAt` — first-seen timestamp
+- `nextSongs[]` — ordered queue
 - `previouslyPlayedSongs[]` — history (used by `/redo`)
 - `currentVoiceChannel` — serialized voice channel data
 
-All DB access goes through `src/database/queries/guilds/{get,update,delete}.ts`.
+WAL mode is enabled for better concurrent-write performance. All DB access
+goes through `src/database/queries/guilds/{get,update,delete}.ts` — read the
+JSON, mutate, write it back via the `upsertGuild` prepared statement.
 
 ### Slash Command Structure
 
@@ -97,13 +113,22 @@ When adding locale keys, they must be nested at the correct JSON path — top-le
 
 ## Environment Variables
 
-Copy `.env.dist` to `.env`. Required vars: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DATABASE_CONNECTION_STRING`, `DATABASE_USER`, `DATABASE_PASSWORD`. Optional: `PREFIX` (default `&`), `LANGUAGE` (default `en-US`), `DETECT_FROM_ALL_MESSAGES` (default `false` — if `true`, bot responds to YouTube URLs in any message without prefix), `DATABASE_NAME` (default `stroycord`), `LOG_DIR` (default `./logs`), `TIMEZONE` (default `Europe/Paris`, Docker only). `YOUTUBE_COOKIES_PATH` — path to a Netscape-format `cookies.txt` exported from YouTube; used alongside the auto-generated PoToken for age-restricted video access.
+Copy `.env.dist` to `.env`. Required: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`.
+Optional: `PREFIX` (default `&`), `LANGUAGE` (default `en-US`),
+`DETECT_FROM_ALL_MESSAGES` (default `false` — if `true`, bot responds to
+YouTube URLs in any message without prefix), `SANO_LOGO` (avatar/icon URL),
+`DATABASE_PATH` (default `data.db`), `LOG_DIR` (default `./logs`),
+`TIMEZONE` (default `Europe/Paris`, Docker only),
+`YOUTUBE_COOKIES_PATH` (path to a Netscape-format `cookies.txt`).
 
-## Release Pipeline
+## Branding
 
-GitHub Actions workflows chain in order: `create_tag.yml` → `build.yml` (Docker image to DockerHub as `destcom/stroycord`) → `deploy.yml` → `release.yml`. Tags are derived from the last commit message on the `release` branch.
+- Bot/footer name: `sano.music`
+- Embed author name: `sano.senxpai`
+- Default avatar/icon: `https://avatars.githubusercontent.com/u/201428450?v=4`
 
 ## Gotchas
 
 - **Docker Alpine image** needs both `ffmpeg` and `python3` (`RUN apk add --no-cache ffmpeg python3`) — `python3` is required by some `youtube-dl-exec` internals.
 - **`message.delete()` in `messageListener`** — always use a `DiscordAPIError`-aware catch; silently ignore codes `10008` (Unknown Message) and `50013` (Missing Permissions), log everything else.
+- **SQLite file location** — defaults to `./data.db`. In Docker, set `DATABASE_PATH=/app/data/data.db` and mount a volume on `/app/data` so the DB persists.

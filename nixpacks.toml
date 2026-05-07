@@ -1,0 +1,13 @@
+# Nixpacks build hints for Railway / Glacier / similar Nixpacks-based hosts.
+
+[phases.setup]
+nixPkgs = ["nodejs_20", "ffmpeg", "python3"]
+
+[phases.install]
+cmds = ["npm ci || npm install"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "node index.js"

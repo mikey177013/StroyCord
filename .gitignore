@@ -4,3 +4,7 @@ logs*
 mongo*
 dist
 *player-script.js.worktrees/
+data.db
+data.db-journal
+data.db-wal
+data.db-shm
