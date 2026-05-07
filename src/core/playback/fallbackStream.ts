@@ -2,11 +2,18 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { PassThrough, type Readable } from 'node:stream';
 import { URL } from 'node:url';
+import { fetchJsonWithRetry } from 'src/core/playback/apiHelpers';
 
 const API_BASE = 'https://api-faa.my.id/faa';
-const API_TIMEOUT_MS = 15_000;
 const STREAM_TIMEOUT_MS = 30_000;
+const STREAM_MAX_REDIRECTS = 5;
 
+/**
+ * The faa.my.id endpoints we use have slightly different shapes depending
+ * on the route — /ytplay returns a single result, /youtube returns an array,
+ * /ytmp3 returns a single result. Be permissive on field names because the
+ * API has been observed to return both `link` and `url` in different builds.
+ */
 interface YtPlayResponse {
   status?: boolean;
   result?: {
@@ -14,7 +21,8 @@ interface YtPlayResponse {
     url?: string;
     mp3?: string;
     thumbnail?: string;
-    duration?: number;
+    duration?: number | string;
+    author?: string;
   };
 }
 
@@ -23,6 +31,7 @@ interface YtSearchResponse {
   result?: Array<{
     title?: string;
     link?: string;
+    url?: string;
   }>;
 }
 
@@ -31,83 +40,115 @@ interface YtMp3Response {
   result?: {
     title?: string;
     mp3?: string;
+    thumbnail?: string;
   };
 }
 
-/**
- * Fetch JSON with a hard timeout. Returns `null` on any failure so callers
- * never need a try/catch — they can just check for `null`.
- */
-async function fetchJsonSafe<T>(url: string): Promise<T | null> {
-  // AbortController gives us a clean timeout without leaking sockets.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: { 'User-Agent': 'sano.music/1.0 (+discord-bot)' },
-    });
-    if (!res.ok) {
-      console.error(`[fallback] ${url} → HTTP ${res.status}`);
-      return null;
-    }
-    const data = (await res.json()) as T;
-    return data;
-  } catch (e) {
-    console.error('[fallback] fetch failed:', (e as Error).message);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+export interface ResolvedFallback {
+  mp3: string;
+  title?: string;
+  thumbnail?: string;
+  /** original YouTube URL when known — handy for downstream caching. */
+  sourceUrl?: string;
 }
 
 /**
- * Resolve a track's MP3 URL via the faa.my.id API, with a 3-step waterfall:
+ * Resolve a track's MP3 URL via the faa.my.id API, with retries and a
+ * three-step waterfall:
  *
- *   1. /faa/ytplay?query=<text or url>           → result.mp3        (fastest path)
- *   2. /faa/youtube?q=<text> → first result.link → /faa/ytmp3?url=…  (search + convert)
- *   3. give up
+ *   1. /faa/ytplay?query=<text>                   → result.mp3        (fastest path)
+ *   2. /faa/youtube?q=<text> → first result.link  → /faa/ytmp3?url=…  (search + convert)
+ *   3. /faa/ytmp3?url=<url>                       → result.mp3        (when caller passes a YT URL)
  *
- * `query` should be either the song title (preferred — the API handles search)
- * or a YouTube URL. Returns `null` if every step fails.
+ * `query` should preferably be the song title (the API search engine handles
+ * free text best). Returns `null` only after every step has been exhausted.
  */
-export async function resolveFallbackMp3(query: string): Promise<{ mp3: string; title?: string } | null> {
-  const safeQuery = encodeURIComponent(query);
+export async function resolveFallbackMp3(query: string): Promise<ResolvedFallback | null> {
+  const trimmed = (query ?? '').trim();
+  if (trimmed === '') {
+    console.error('[fallback] empty query — refusing to call API');
+    return null;
+  }
+  const safeQuery = encodeURIComponent(trimmed);
 
-  // Step 1 — direct ytplay
-  const ytplay = await fetchJsonSafe<YtPlayResponse>(`${API_BASE}/ytplay?query=${safeQuery}`);
+  // Step 1 — direct /ytplay (matches the example response in the spec)
+  const ytplay = await fetchJsonWithRetry<YtPlayResponse>(`${API_BASE}/ytplay?query=${safeQuery}`, {
+    tag: 'fallback:ytplay',
+  });
   if (ytplay?.status && ytplay.result?.mp3) {
-    return { mp3: ytplay.result.mp3, title: ytplay.result.title };
+    return {
+      mp3: ytplay.result.mp3,
+      title: ytplay.result.title,
+      thumbnail: ytplay.result.thumbnail,
+      sourceUrl: ytplay.result.url,
+    };
   }
 
-  // Step 2 — search for first result, then ytmp3
-  const search = await fetchJsonSafe<YtSearchResponse>(`${API_BASE}/youtube?q=${safeQuery}`);
-  const firstLink = search?.result?.[0]?.link;
-  if (firstLink) {
-    const ytmp3 = await fetchJsonSafe<YtMp3Response>(`${API_BASE}/ytmp3?url=${encodeURIComponent(firstLink)}`);
+  // Step 2 — /youtube search → /ytmp3
+  const search = await fetchJsonWithRetry<YtSearchResponse>(`${API_BASE}/youtube?q=${safeQuery}`, {
+    tag: 'fallback:search',
+  });
+  const firstHit = search?.result?.[0];
+  const firstLink = firstHit?.link ?? firstHit?.url;
+  if (search?.status && firstLink) {
+    const ytmp3 = await fetchJsonWithRetry<YtMp3Response>(`${API_BASE}/ytmp3?url=${encodeURIComponent(firstLink)}`, {
+      tag: 'fallback:ytmp3',
+    });
     if (ytmp3?.status && ytmp3.result?.mp3) {
-      return { mp3: ytmp3.result.mp3, title: ytmp3.result.title };
+      return {
+        mp3: ytmp3.result.mp3,
+        title: ytmp3.result.title ?? firstHit?.title,
+        thumbnail: ytmp3.result.thumbnail,
+        sourceUrl: firstLink,
+      };
     }
   }
 
-  // Step 3 — also try ytmp3 directly if the caller passed a youtube URL
-  if (/youtu(?:\.be|be\.com)/i.test(query)) {
-    const ytmp3 = await fetchJsonSafe<YtMp3Response>(`${API_BASE}/ytmp3?url=${safeQuery}`);
+  // Step 3 — caller passed a YT URL directly
+  if (/youtu(?:\.be|be\.com)/i.test(trimmed)) {
+    const ytmp3 = await fetchJsonWithRetry<YtMp3Response>(`${API_BASE}/ytmp3?url=${safeQuery}`, {
+      tag: 'fallback:ytmp3-direct',
+    });
     if (ytmp3?.status && ytmp3.result?.mp3) {
-      return { mp3: ytmp3.result.mp3, title: ytmp3.result.title };
+      return {
+        mp3: ytmp3.result.mp3,
+        title: ytmp3.result.title,
+        thumbnail: ytmp3.result.thumbnail,
+        sourceUrl: trimmed,
+      };
     }
   }
 
-  console.error('[fallback] all API endpoints failed for query:', query);
+  console.error('[fallback] API returned invalid response — all endpoints exhausted');
   return null;
 }
 
 /**
  * Open an HTTP/HTTPS stream for the given MP3 URL with redirect following.
  * Returns a `Readable` (PassThrough) that stays alive even across 302 hops,
- * or `null` if the URL fails to open.
+ * or `null` if the target is malformed before we even try to dial.
+ *
+ * The PassThrough is destroyed on any network error so consumers see a
+ * single failure event rather than a half-open stream.
  */
 export function streamMp3Url(mp3Url: string): Readable | null {
+  if (!mp3Url || typeof mp3Url !== 'string') {
+    console.error('[fallback] streamMp3Url called with empty url');
+    return null;
+  }
+
+  let parsedInitial: URL;
+  try {
+    parsedInitial = new URL(mp3Url);
+  } catch {
+    console.error('[fallback] invalid mp3 URL');
+    return null;
+  }
+  if (parsedInitial.protocol !== 'http:' && parsedInitial.protocol !== 'https:') {
+    console.error('[fallback] unsupported protocol on mp3 URL:', parsedInitial.protocol);
+    return null;
+  }
+
   const passthrough = new PassThrough();
   let settled = false;
 
@@ -116,7 +157,6 @@ export function streamMp3Url(mp3Url: string): Readable | null {
     try {
       parsed = new URL(target);
     } catch {
-      console.error('[fallback] invalid mp3 URL:', target);
       passthrough.destroy(new Error('invalid mp3 URL'));
       return;
     }
@@ -137,16 +177,15 @@ export function streamMp3Url(mp3Url: string): Readable | null {
       (res) => {
         const status = res.statusCode ?? 0;
 
-        // follow redirects (301/302/307/308)
         if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirectsLeft > 0) {
           const next = new URL(res.headers.location, target).toString();
-          res.resume(); // discard body
+          res.resume();
           open(next, redirectsLeft - 1);
           return;
         }
 
         if (status < 200 || status >= 300) {
-          console.error(`[fallback] mp3 stream HTTP ${status} on ${target}`);
+          console.error(`[fallback] mp3 stream HTTP ${status}`);
           res.resume();
           passthrough.destroy(new Error(`mp3 HTTP ${status}`));
           return;
@@ -155,11 +194,12 @@ export function streamMp3Url(mp3Url: string): Readable | null {
         settled = true;
         res.pipe(passthrough);
         res.on('error', (e) => passthrough.destroy(e));
+        res.on('aborted', () => passthrough.destroy(new Error('mp3 stream aborted')));
       }
     );
 
     req.setTimeout(STREAM_TIMEOUT_MS, () => {
-      console.error('[fallback] mp3 stream timeout on', target);
+      console.error('[fallback] mp3 stream timeout');
       req.destroy(new Error('stream timeout'));
     });
 
@@ -173,21 +213,30 @@ export function streamMp3Url(mp3Url: string): Readable | null {
     req.end();
   };
 
-  open(mp3Url, 5);
+  open(mp3Url, STREAM_MAX_REDIRECTS);
   return passthrough;
 }
 
 /**
  * High-level helper used by the player: given a song URL or title, ask the
  * faa.my.id API for an MP3, open it, and return a Readable ready for
- * `createAudioResource`.
+ * `createAudioResource` along with the resolved metadata (so the caller can
+ * use `mp3` / `sourceUrl` when building cache filenames).
  */
-export async function createFallbackApiStream(query: string): Promise<{ stream: Readable; title?: string } | null> {
+export async function createFallbackApiStream(
+  query: string
+): Promise<{ stream: Readable; title?: string; mp3: string; sourceUrl?: string } | null> {
   const resolved = await resolveFallbackMp3(query);
   if (!resolved) return null;
 
   const stream = streamMp3Url(resolved.mp3);
   if (!stream) return null;
 
-  return { stream, title: resolved.title };
+  console.log('[player] using fallback API');
+  return {
+    stream,
+    title: resolved.title,
+    mp3: resolved.mp3,
+    sourceUrl: resolved.sourceUrl,
+  };
 }
