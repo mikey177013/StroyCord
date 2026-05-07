@@ -2,6 +2,7 @@ import { Client, GatewayIntentBits } from 'discord.js';
 
 import i18n from './config/i18n';
 import { secrets } from './config/secrets';
+import { initLocalCache } from './core/playback/localCache';
 import { connectToDatabase } from './database/databaseConnect';
 import errorListeners from './listeners/errorListeners';
 import messageListener from './listeners/messageListener';
@@ -25,6 +26,8 @@ const init = async () => {
   ready(client);
   errorListeners(client);
   messageListener(client);
+
+  initLocalCache();
 
   await connectToDatabase();
 

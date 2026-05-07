@@ -11,6 +11,7 @@ import {
 import { activePlayers, client } from 'src/Bot';
 import { sendErrorEmbed } from 'src/core/messages';
 import { createFallbackApiStream } from 'src/core/playback/fallbackStream';
+import { downloadToCache, findCachedTrack, openCachedStream } from 'src/core/playback/localCache';
 import { shouldUseFallback } from 'src/core/playback/shouldUseFallback';
 import { createYtdlpStream } from 'src/core/playback/ytdlpStream';
 import { emptyNextSongs, removeCurrentPlayingSong } from 'src/database/queries/guilds/delete';
@@ -85,12 +86,13 @@ function runYtdlp(
       if (trimmed) console.error(`[player] yt-dlp stderr: ${trimmed}`);
 
       if (settled) {
-        // Stream already handed off — nothing to do here. Errors after the
-        // fact get reported via the audio-player error listener.
+        // Stream already handed off — log EOF for clarity.
+        console.log('[player] stream ended');
         return;
       }
 
       settled = true;
+      console.error('[player] yt-dlp failed');
       const useFallback = shouldUseFallback({ exitCode: code, stderr: trimmed, bytesStreamed });
       if (useFallback) {
         resolveOnce({ needsFallback: true, reason: trimmed || `yt-dlp exited ${code}` });
@@ -108,29 +110,35 @@ function runYtdlp(
 
 /**
  * Try the external-API fallback for a song. The API takes either a YouTube
- * URL or a free-text query — we pass the title first (it's the most
- * forgiving), and only fall back to the URL if that yields nothing.
+ * URL or a free-text query — we always pass the *title* (the API was
+ * designed for free-text search). Never use the raw URL as a query, that
+ * was the source of the "youtube.com" bug.
  */
 async function runFallback(song: songInterface): Promise<Readable | null> {
-  console.log('[player] using fallback API for:', song.title);
-
-  // Title first — this is what the API was designed for.
-  if (song.title && song.title.trim() !== '') {
-    const result = await createFallbackApiStream(song.title);
-    if (result) {
-      console.log('[player] fallback stream started (via title):', result.title ?? song.title);
-      return result.stream;
-    }
+  const query = (song.title ?? '').trim();
+  if (!query) {
+    console.error('[player] cannot run fallback — song has no title');
+    return null;
   }
 
-  // URL as a last resort.
-  const result = await createFallbackApiStream(song.url);
+  const result = await createFallbackApiStream(query);
   if (result) {
-    console.log('[player] fallback stream started (via url):', result.title ?? song.url);
+    console.log('[player] fallback stream started:', result.title ?? query);
     return result.stream;
   }
-
   return null;
+}
+
+/**
+ * Last-resort path: download the audio with yt-dlp into the local cache and
+ * stream it from disk. Slower than the live pipeline but works even when
+ * Discord-friendly streaming is impossible (anti-bot, expired cookies, etc.).
+ */
+async function runLocalCacheFallback(song: songInterface): Promise<Readable | null> {
+  console.log('[player] local fallback started');
+  const path = await downloadToCache(song.url, { title: song.title, url: song.url });
+  if (!path) return null;
+  return openCachedStream(path);
 }
 
 export const songPlayer = async (guildId: string) => {
@@ -160,49 +168,64 @@ export const songPlayer = async (guildId: string) => {
     createAudioPlayerListener(audioPlayer, guildId);
   }
 
-  // ─── Primary: yt-dlp ──────────────────────────────────────────────────
-  console.log(`[player] streaming ${nextSong.url} via yt-dlp`);
-  let outcome: Awaited<ReturnType<typeof runYtdlp>>;
-  try {
-    outcome = await runYtdlp(nextSong.url);
-  } catch (e) {
-    console.error('[player] runYtdlp threw:', e);
-    outcome = { needsFallback: true, reason: (e as Error).message };
-  }
-
+  // ─── 1. Cached mp3 (fastest, zero network) ────────────────────────────
   let resourceStream: Readable | null = null;
-  let usedFallback = false;
-
-  if ('stream' in outcome) {
-    resourceStream = outcome.stream;
-  } else if ('needsFallback' in outcome) {
-    console.error('[player] yt-dlp failed:', outcome.reason);
-    try {
-      resourceStream = await runFallback(nextSong);
-      usedFallback = resourceStream !== null;
-    } catch (e) {
-      console.error('[player] fallback threw:', e);
-      resourceStream = null;
+  try {
+    const cached = await findCachedTrack({ title: nextSong.title, url: nextSong.url });
+    if (cached) {
+      resourceStream = openCachedStream(cached);
     }
-  } else {
-    // fatal — try fallback once anyway, never crash the bot.
-    console.error('[player] yt-dlp fatal:', outcome.reason);
+  } catch (e) {
+    console.error('[player] cache lookup failed:', e);
+  }
+
+  // ─── 2. yt-dlp live stream ────────────────────────────────────────────
+  if (!resourceStream) {
+    console.log(`[player] streaming ${nextSong.url} via yt-dlp`);
+    let outcome: Awaited<ReturnType<typeof runYtdlp>>;
     try {
-      resourceStream = await runFallback(nextSong);
-      usedFallback = resourceStream !== null;
+      outcome = await runYtdlp(nextSong.url);
     } catch (e) {
-      console.error('[player] fallback threw:', e);
-      resourceStream = null;
+      console.error('[player] runYtdlp threw:', e);
+      outcome = { needsFallback: true, reason: (e as Error).message };
+    }
+
+    if ('stream' in outcome) {
+      resourceStream = outcome.stream;
+    } else if ('needsFallback' in outcome) {
+      console.error('[player] yt-dlp failed:', outcome.reason);
+    } else {
+      console.error('[player] yt-dlp fatal:', outcome.reason);
     }
   }
 
+  // ─── 3. Fallback API (faa.my.id) ──────────────────────────────────────
   if (!resourceStream) {
+    try {
+      resourceStream = await runFallback(nextSong);
+    } catch (e) {
+      console.error('[player] fallback API threw:', e);
+    }
+  }
+
+  // ─── 4. Local scrape/download ─────────────────────────────────────────
+  if (!resourceStream) {
+    try {
+      resourceStream = await runLocalCacheFallback(nextSong);
+    } catch (e) {
+      console.error('[player] local fallback threw:', e);
+    }
+  }
+
+  // ─── 5. Give up — skip the broken song, keep the queue alive ──────────
+  if (!resourceStream) {
+    console.error('[player] skipping broken song:', nextSong.title);
     await sendErrorEmbed(
       guildId,
       nextSong.requestChannel,
-      `Could not play **${nextSong.title}** — both yt-dlp and the fallback failed.`
-    );
-    // Move on to the next song so the queue doesn't get stuck.
+      `Could not play **${nextSong.title}** — every playback path failed.`
+    ).catch((e) => console.error('[player] sendErrorEmbed error:', e));
+
     try {
       await skipSong(guildId);
     } catch (e) {
@@ -211,12 +234,35 @@ export const songPlayer = async (guildId: string) => {
     return;
   }
 
-  if (usedFallback) {
-    console.log(`[player] fallback stream started for: ${nextSong.title}`);
+  // Defensive: if the stream is destroyed before we wrap it, bail out.
+  if ('destroyed' in resourceStream && (resourceStream as Readable).destroyed) {
+    console.error('[player] resource stream was destroyed before playback');
+    try {
+      await skipSong(guildId);
+    } catch (e) {
+      console.error('[player] skip-after-destroyed error:', e);
+    }
+    return;
   }
 
-  const audioStream = createAudioResource(resourceStream, {
-    inputType: StreamType.Arbitrary,
+  let audioStream: ReturnType<typeof createAudioResource>;
+  try {
+    audioStream = createAudioResource(resourceStream, {
+      inputType: StreamType.Arbitrary,
+    });
+  } catch (e) {
+    console.error('[player] createAudioResource failed — skipping broken song:', e);
+    try {
+      await skipSong(guildId);
+    } catch (err) {
+      console.error('[player] skip-after-resource-error:', err);
+    }
+    return;
+  }
+
+  // Surface late stream errors instead of crashing the process.
+  resourceStream.on('error', (err) => {
+    console.error('[player] resource stream error:', err);
   });
 
   audioPlayer.play(audioStream);
