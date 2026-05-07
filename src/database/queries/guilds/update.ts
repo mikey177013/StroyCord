@@ -1,28 +1,49 @@
-import { guild_model } from 'src/database/schema/guild';
+import { db } from '../../db';
+import type { Guild } from '../../schema/guild';
+import { fetchGuild, getGuild } from './get';
 
-import { emptyNextSongs } from './delete';
-import { fetchGuild } from './get';
+const upsertStmt = db.prepare(
+  `INSERT INTO guilds (id, data)
+   VALUES (?, ?)
+   ON CONFLICT(id) DO UPDATE SET data = excluded.data`
+);
+
+export const upsertGuild = (guild: Guild) => {
+  upsertStmt.run(guild.guildId, JSON.stringify(guild));
+};
+
+export const updateGuild = (guild: Guild) => upsertGuild(guild);
 
 export const pushSongs = async (guildId: string, data: object[]) => {
-  return await guild_model.updateOne({ guildId }, { $push: { nextSongs: { $each: data } } });
+  const guild = await fetchGuild(guildId);
+  guild.nextSongs = [...(guild.nextSongs ?? []), ...(data as Guild['nextSongs'])];
+  upsertGuild(guild);
 };
 
 export const shiftSongs = async (guildId: string) => {
-  //get the first song, move it to previouslyPlayedSongs and remove it from nextSongs
   const guild = await fetchGuild(guildId);
-  if (guild.nextSongs == null || guild.nextSongs.length === 0) {
-    return await emptyNextSongs(guildId);
+
+  if (!guild.nextSongs || guild.nextSongs.length === 0) {
+    guild.nextSongs = [];
+    upsertGuild(guild);
+    return;
   }
-  const firstSong = guild.nextSongs[0];
-  return await guild_model.updateOne(
-    { guildId },
-    {
-      $push: { previouslyPlayedSongs: firstSong },
-      $pop: { nextSongs: -1 },
-    }
-  );
+
+  const [firstSong, ...rest] = guild.nextSongs;
+  guild.nextSongs = rest;
+  guild.previouslyPlayedSongs = [...(guild.previouslyPlayedSongs ?? []), firstSong];
+  upsertGuild(guild);
 };
 
 export const updateVoiceChannel = async (guildId: string, data: object) => {
-  return await guild_model.updateOne({ guildId }, { currentVoiceChannel: data });
+  const guild = await fetchGuild(guildId);
+  guild.currentVoiceChannel = data as Guild['currentVoiceChannel'];
+  upsertGuild(guild);
+};
+
+// Convenience helper — auto-create with sensible defaults.
+export const getOrCreateGuild = async (guildId: string): Promise<Guild> => {
+  const existing = getGuild(guildId);
+  if (existing) return existing;
+  return await fetchGuild(guildId);
 };

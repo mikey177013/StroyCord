@@ -1,33 +1,53 @@
-import { guild_model } from 'src/database/schema/guild';
-
+import { db } from '../../db';
 import { fetchGuild } from './get';
+import { upsertGuild } from './update';
+
+const deleteStmt = db.prepare('DELETE FROM guilds WHERE id = ?');
+const selectAllStmt = db.prepare('SELECT id, data FROM guilds');
+
+export const deleteGuild = (guildId: string) => {
+  deleteStmt.run(guildId);
+};
 
 export const emptyNextSongs = async (guildId: string) => {
-  return await guild_model.updateOne({ guildId }, { nextSongs: [] });
+  const guild = await fetchGuild(guildId);
+  guild.nextSongs = [];
+  upsertGuild(guild);
 };
 
 export const removeCurrentPlayingSong = async (guildId: string) => {
   const guild = await fetchGuild(guildId);
-  if (guild.nextSongs == null) {
-    return await emptyNextSongs(guildId);
+  if (!guild.nextSongs || guild.nextSongs.length === 0) {
+    guild.nextSongs = [];
+    upsertGuild(guild);
+    return;
   }
-  const firstSong = guild.nextSongs[0];
-  return await guild_model.updateOne(
-    { guildId },
-    { $push: { previouslyPlayedSongs: firstSong }, $pop: { nextSongs: -1 } }
-  );
+
+  const [firstSong, ...rest] = guild.nextSongs;
+  guild.nextSongs = rest;
+  guild.previouslyPlayedSongs = [...(guild.previouslyPlayedSongs ?? []), firstSong];
+  upsertGuild(guild);
 };
 
 export const emptyAllGuild = async () => {
   try {
-    await guild_model.updateMany({}, { nextSongs: [], currentVoiceChannel: {} });
-    console.log('All guilds have been emptied !');
+    const rows = selectAllStmt.all() as { id: string; data: string }[];
+    for (const row of rows) {
+      try {
+        const guild = JSON.parse(row.data);
+        guild.nextSongs = [];
+        guild.currentVoiceChannel = null;
+        upsertGuild(guild);
+      } catch {
+        // skip corrupted rows silently
+      }
+    }
+    console.log('[db] all guilds emptied');
   } catch (error) {
-    console.log(error);
-    console.log('Error emptying all guilds !');
+    console.error('[db] error emptying all guilds:', error);
   }
 };
 
 export const removeGuild = async (guildId: string) => {
-  return await guild_model.deleteOne({ guildId });
+  deleteStmt.run(guildId);
 };

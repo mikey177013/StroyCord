@@ -1,33 +1,27 @@
-import mongoose from 'mongoose';
+import type { songInterface } from 'src/utils/interfaces';
 
-export const guild_model = mongoose.model(
-  'Guild',
-  new mongoose.Schema({
-    guildId: {
-      type: String,
-      required: true,
-    },
-    registeredAt: {
-      type: Date,
-      required: true,
-      default: Date.now,
-    },
+export interface VoiceChannelData {
+  channelId: string;
+  guildId: string;
+  // intentionally permissive — Discord's runtime objects (Guild, adapterCreator)
+  // are stored verbatim and we never round-trip them through JSON safely
+  // beyond { channelId, guildId }, which is all the player needs.
+  // biome-ignore lint/suspicious/noExplicitAny: see comment above
+  [key: string]: any;
+}
 
-    currentVoiceChannel: {
-      type: mongoose.Schema.Types.Mixed,
-      required: false,
-      default: null,
-    },
+export interface Guild {
+  guildId: string;
+  registeredAt: number;
+  currentVoiceChannel: VoiceChannelData | null;
+  previouslyPlayedSongs: songInterface[];
+  nextSongs: songInterface[];
+}
 
-    previouslyPlayedSongs: {
-      type: [mongoose.Schema.Types.Mixed],
-      required: false,
-      default: [],
-    },
-    nextSongs: {
-      type: [mongoose.Schema.Types.Mixed],
-      required: false,
-      default: [],
-    },
-  })
-);
+export const createDefaultGuild = (guildId: string): Guild => ({
+  guildId,
+  registeredAt: Date.now(),
+  currentVoiceChannel: null,
+  previouslyPlayedSongs: [],
+  nextSongs: [],
+});

@@ -5,7 +5,6 @@ export const setActivity = async (client: Client) => {
     return;
   }
 
-  return client.user.setActivity(
-    `Currently playing music for ${client.guilds.cache.size} server${client.guilds.cache.size > 1 ? 's' : ''} !`
-  );
+  const count = client.guilds.cache.size;
+  return client.user.setActivity(`music in ${count} server${count > 1 ? 's' : ''}`);
 };
