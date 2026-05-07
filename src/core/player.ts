@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { Readable } from 'node:stream';
 import {
   AudioPlayerStatus,
   createAudioPlayer,
@@ -10,6 +10,9 @@ import {
 } from '@discordjs/voice';
 import { activePlayers, client } from 'src/Bot';
 import { sendErrorEmbed } from 'src/core/messages';
+import { createFallbackApiStream } from 'src/core/playback/fallbackStream';
+import { shouldUseFallback } from 'src/core/playback/shouldUseFallback';
+import { createYtdlpStream } from 'src/core/playback/ytdlpStream';
 import { emptyNextSongs, removeCurrentPlayingSong } from 'src/database/queries/guilds/delete';
 import { getCurrentVoiceChannel, getFirstSong, getNextSongs } from 'src/database/queries/guilds/get';
 import { shiftSongs } from 'src/database/queries/guilds/update';
@@ -20,51 +23,130 @@ import {
 } from 'src/listeners/playerListeners';
 import type { songInterface } from 'src/utils/interfaces';
 
-// yt-dlp binary path managed by youtube-dl-exec (downloaded automatically on first use)
-const YTDLP_BIN = join(
-  dirname(require.resolve('youtube-dl-exec/package.json')),
-  'bin',
-  process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'
-);
+/**
+ * Run the primary yt-dlp pipeline for a single track.
+ *
+ * Returns:
+ *   - { stream }                 → caller should pipe this into discord
+ *   - { needsFallback: true, … } → yt-dlp failed in a way that warrants the
+ *                                  external-API fallback
+ *   - { fatal: true, … }         → unrecoverable spawn-level failure
+ */
+function runYtdlp(
+  url: string
+): Promise<
+  | { stream: Readable; child: ChildProcessWithoutNullStreams }
+  | { needsFallback: true; reason: string }
+  | { fatal: true; reason: string }
+> {
+  return new Promise((resolveOnce) => {
+    let settled = false;
+    let stderrBuf = '';
+    let bytesStreamed = 0;
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = createYtdlpStream(url);
+    } catch (e) {
+      resolveOnce({ fatal: true, reason: `yt-dlp spawn threw: ${(e as Error).message}` });
+      return;
+    }
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+    });
+
+    // First chunk of audio bytes = success — hand the stream to Discord.
+    const onFirstByte = (chunk: Buffer) => {
+      bytesStreamed += chunk.length;
+      if (settled) return;
+      // Need at least a small payload before we trust the stream — single
+      // 0-byte reads or tiny error blobs would otherwise look successful.
+      if (bytesStreamed < 256) return;
+
+      settled = true;
+      child.stdout.off('data', onFirstByte);
+      // Re-attach a counter that doesn't gate the resolution.
+      child.stdout.on('data', (c: Buffer) => {
+        bytesStreamed += c.length;
+      });
+      resolveOnce({ stream: child.stdout, child });
+    };
+    child.stdout.on('data', onFirstByte);
+
+    child.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      resolveOnce({ fatal: true, reason: `yt-dlp spawn error: ${e.message}` });
+    });
+
+    child.on('close', (code) => {
+      const trimmed = stderrBuf.trim();
+      if (trimmed) console.error(`[player] yt-dlp stderr: ${trimmed}`);
+
+      if (settled) {
+        // Stream already handed off — nothing to do here. Errors after the
+        // fact get reported via the audio-player error listener.
+        return;
+      }
+
+      settled = true;
+      const useFallback = shouldUseFallback({ exitCode: code, stderr: trimmed, bytesStreamed });
+      if (useFallback) {
+        resolveOnce({ needsFallback: true, reason: trimmed || `yt-dlp exited ${code}` });
+        return;
+      }
+      resolveOnce({
+        fatal: true,
+        reason: trimmed
+          ? `yt-dlp failed: ${trimmed.split('\n').slice(-1)[0]}`
+          : `yt-dlp exited ${code} before delivering audio`,
+      });
+    });
+  });
+}
 
 /**
- * Spawns yt-dlp and pipes its stdout directly to Discord's audio player.
- *
- * Why yt-dlp instead of youtubei.js download():
- * YouTube (2025) requires BotGuard-attested PoTokens for WEB client streaming.
- * Generating a valid BotGuard PoToken in Node.js without a real browser is not
- * possible — jsdom fails the APF runtime assertion. Alternative clients
- * (iOS, ANDROID, WEB_REMIX) all produce rqh=1 URLs that YouTube rejects when
- * fetched outside the expected client headers.
- *
- * yt-dlp handles YouTube authentication internally and is continuously updated
- * by the community to match YouTube's evolving restrictions. No PoToken
- * or cookie setup is required on our end.
- *
- * Note: youtube-dl-exec downloads the yt-dlp binary automatically on first run.
+ * Try the external-API fallback for a song. The API takes either a YouTube
+ * URL or a free-text query — we pass the title first (it's the most
+ * forgiving), and only fall back to the URL if that yields nothing.
  */
-function createYtdlpStream(url: string) {
-  // spawn is safe: arguments are passed as an array (no shell, no injection)
-  return spawn(YTDLP_BIN, [
-    url,
-    '--output',
-    '-', // pipe audio to stdout
-    '--format',
-    'bestaudio', // best available audio-only format
-    '--quiet',
-    '--no-warnings',
-  ]);
+async function runFallback(song: songInterface): Promise<Readable | null> {
+  console.log('[player] using fallback API for:', song.title);
+
+  // Title first — this is what the API was designed for.
+  if (song.title && song.title.trim() !== '') {
+    const result = await createFallbackApiStream(song.title);
+    if (result) {
+      console.log('[player] fallback stream started (via title):', result.title ?? song.title);
+      return result.stream;
+    }
+  }
+
+  // URL as a last resort.
+  const result = await createFallbackApiStream(song.url);
+  if (result) {
+    console.log('[player] fallback stream started (via url):', result.title ?? song.url);
+    return result.stream;
+  }
+
+  return null;
 }
 
 export const songPlayer = async (guildId: string) => {
   const voiceChannel = await getCurrentVoiceChannel(guildId);
   const nextSong: songInterface = await getFirstSong(guildId);
-  const adapterCreator = (await client.guilds.fetch(voiceChannel.guildId)).voiceAdapterCreator;
-  let audioPlayer = activePlayers[guildId]?.audioPlayer;
 
   if (nextSong === undefined) {
     return;
   }
+  if (!voiceChannel) {
+    console.error('[player] no voice channel stored for guild', guildId);
+    return;
+  }
+
+  const adapterCreator = (await client.guilds.fetch(voiceChannel.guildId)).voiceAdapterCreator;
+  let audioPlayer = activePlayers[guildId]?.audioPlayer;
 
   const connection = joinVoiceChannel({
     channelId: voiceChannel.channelId,
@@ -74,40 +156,66 @@ export const songPlayer = async (guildId: string) => {
 
   if (!audioPlayer) {
     audioPlayer = createAudioPlayer();
-    activePlayers[guildId] = {
-      audioPlayer,
-    };
-
+    activePlayers[guildId] = { audioPlayer };
     createAudioPlayerListener(audioPlayer, guildId);
   }
 
-  const ytdlp = createYtdlpStream(nextSong.url);
-
-  let stderrBuf = '';
-  ytdlp.stderr.on('data', (chunk: Buffer) => {
-    stderrBuf += chunk.toString();
-  });
-
-  ytdlp.on('error', async (e) => {
-    console.error('[player] yt-dlp spawn error:', e);
-    await sendErrorEmbed(guildId, nextSong.requestChannel, `Failed to start playback for: **${nextSong.title}**`);
-  });
-
-  ytdlp.on('close', async (code) => {
-    const msg = stderrBuf.trim();
-    if (msg) console.error(`[player] yt-dlp: ${msg}`);
-    if (code !== 0 && code !== null) {
-      const reason = msg.includes('ERROR:') ? msg.split('ERROR:').pop()?.trim() : undefined;
-      await sendErrorEmbed(
-        guildId,
-        nextSong.requestChannel,
-        reason ? `**${nextSong.title}** — ${reason}` : `Could not play **${nextSong.title}** (yt-dlp exited ${code})`
-      );
-    }
-  });
-
+  // ─── Primary: yt-dlp ──────────────────────────────────────────────────
   console.log(`[player] streaming ${nextSong.url} via yt-dlp`);
-  const audioStream = createAudioResource(ytdlp.stdout, {
+  let outcome: Awaited<ReturnType<typeof runYtdlp>>;
+  try {
+    outcome = await runYtdlp(nextSong.url);
+  } catch (e) {
+    console.error('[player] runYtdlp threw:', e);
+    outcome = { needsFallback: true, reason: (e as Error).message };
+  }
+
+  let resourceStream: Readable | null = null;
+  let usedFallback = false;
+
+  if ('stream' in outcome) {
+    resourceStream = outcome.stream;
+  } else if ('needsFallback' in outcome) {
+    console.error('[player] yt-dlp failed:', outcome.reason);
+    try {
+      resourceStream = await runFallback(nextSong);
+      usedFallback = resourceStream !== null;
+    } catch (e) {
+      console.error('[player] fallback threw:', e);
+      resourceStream = null;
+    }
+  } else {
+    // fatal — try fallback once anyway, never crash the bot.
+    console.error('[player] yt-dlp fatal:', outcome.reason);
+    try {
+      resourceStream = await runFallback(nextSong);
+      usedFallback = resourceStream !== null;
+    } catch (e) {
+      console.error('[player] fallback threw:', e);
+      resourceStream = null;
+    }
+  }
+
+  if (!resourceStream) {
+    await sendErrorEmbed(
+      guildId,
+      nextSong.requestChannel,
+      `Could not play **${nextSong.title}** — both yt-dlp and the fallback failed.`
+    );
+    // Move on to the next song so the queue doesn't get stuck.
+    try {
+      await skipSong(guildId);
+    } catch (e) {
+      console.error('[player] skip-after-failure error:', e);
+    }
+    return;
+  }
+
+  if (usedFallback) {
+    console.log(`[player] fallback stream started for: ${nextSong.title}`);
+  }
+
+  const audioStream = createAudioResource(resourceStream, {
     inputType: StreamType.Arbitrary,
   });
 
